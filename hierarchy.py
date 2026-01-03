@@ -22,6 +22,10 @@ class Hierarchy:
         self.node_to_idx = {node: i for i, node in enumerate(self.nodes)}
         self.bottom_nodes = [n for n in self.nodes if self.graph.out_degree(n) == 0]
         self.m_bottom = len(self.bottom_nodes)
+
+    def get_bottom_indices(self):
+        """Returns the indices of bottom-level nodes in the node list."""
+        return [self.node_to_idx[n] for n in self.bottom_nodes]
         
     def _build_graph(self, structure):
         """Constructs a NetworkX DiGraph from the structure dict."""

@@ -276,6 +276,115 @@ class GSGLS:
         
         return Z
 
+    def reconcile_impute(self, Y_hat, maxiter=None, tol=1e-5):
+        """
+        Apply reconciliation with imputation for missing values (NaNs).
+        Uses a Masked Conjugate Gradient solver for the Spatial projection.
+        
+        Args:
+            Y_hat: (n_nodes x n_timesteps) matrix with NaNs.
+            maxiter: Max iterations for CG.
+            tol: Tolerance for CG.
+            
+        Returns:
+            Z: Reconciled (and imputed) forecasts.
+        """
+        n_nodes, n_timesteps = Y_hat.shape
+        Z = np.zeros_like(Y_hat)
+        
+        # Q is spatial precision
+        Q = self.spatial_prec_matrix
+        S = self.S_sp_sparse
+        ST = S.T
+        
+        # Iterate over timesteps because masking might vary
+        # Optimization: Group columns with same mask if possible, 
+        # but for random missingness, just loop.
+        
+        for t in range(n_timesteps):
+            y_col = Y_hat[:, t]
+            mask_bool = ~np.isnan(y_col)
+            
+            # If no missing values, use fast cached solver
+            if np.all(mask_bool):
+                rhs = ST @ (Q @ y_col)
+                coeffs = self.H_sp_factor.solve(rhs)
+                z_col = S @ coeffs
+                Z[:, t] = z_col
+                continue
+                
+            # Handle missing values
+            # Replace NaN with 0 for computation (effective weight 0)
+            y_filled = np.nan_to_num(y_col, nan=0.0)
+            
+            # Mask matrix M (diagonal)
+            # Actually we just zero out rows/cols of Q implicitly.
+            # LHS = S.T @ (M @ Q @ M) @ S
+            # RHS = S.T @ (M @ Q @ M) @ y_filled
+            # Wait, if y_filled has 0s where Mask is 0, then M @ y_filled = y_filled.
+            # So RHS = S.T @ M @ Q @ y_filled? 
+            # If Q is diagonal, Yes. If Q is dense/Laplacian:
+            # We want to minimize (y - Sx)' M' Q M (y - Sx) ? 
+            # Or is Missingness implying "Observation not available"?
+            # Prompt says: "set corresponding row/column of precision matrix to zero".
+            # If Prec is Q, we want Q_mod = M Q M.
+            # Then solve (S' Q_mod S) x = S' Q_mod y.
+            
+            # Let's define the LinearOperator for A = S' M Q M S
+            # mask_bool is 1 for observed, 0 for missing.
+            # We need to apply M as elementwise mult.
+            
+            def mv(v):
+                # v is shape (m_s,) where m_s is number of bottom series (coeffs)
+                # S v -> (n_nodes,)
+                # M (S v)
+                # Q (M S v)
+                # M (Q M S v)
+                # S.T (M Q M S v)
+                
+                Sv = S @ v
+                MSv = Sv * mask_bool # Apply Mask
+                QMSv = Q @ MSv
+                MQMSv = QMSv * mask_bool # Apply Mask
+                return ST @ MQMSv
+            
+            m_s = S.shape[1]
+            A = scipy.sparse.linalg.LinearOperator((m_s, m_s), matvec=mv)
+            
+            # Compute RHS
+            # rhs = S.T @ M @ Q @ M @ y_filled
+            # y_filled has 0s where mask is 0, so M @ y_filled = y_filled effectively?
+            # BUT y_filled might have non-zeros where we want 0 if we filled with mean?
+            # Ideally y_filled is exactly 0 at missing indices.
+            # M @ y = y_filled.
+            # Q @ y_filled
+            # M @ (Q @ y_filled)
+            # S.T @ ...
+            
+            # Ensure y_filled is 0 at missing
+            y_in = y_filled * mask_bool
+            rhs = ST @ (mask_bool * (Q @ y_in))
+            
+            # Initial guess: 0 or maybe warm start?
+            x0 = np.zeros(m_s)
+            
+            # Solve
+            # Use callback to monitor? No.
+            coeffs, info = scipy.sparse.linalg.cg(A, rhs, x0=x0, rtol=tol, maxiter=maxiter)
+            
+            if info != 0:
+                pass # print(f"CG Warning at t={t}: {info}")
+                
+            Z[:, t] = S @ coeffs
+            
+        # 3. Apply Temporal if needed (though masked input makes it tricky)
+        # We perform temporal projection on the spatially-reconciled result
+        # Assuming Z is now fully dense and coherent spatially.
+        if self.P_tm is not None:
+             Z = Z @ self.P_tm.T
+             
+        return Z
+
     def get_spectral_covariance_inverse(self):
         """Return the diagonal Lambda^-1 for inspection."""
         if self.spectral_density is None: return None
